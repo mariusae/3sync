@@ -1,0 +1,21 @@
+cabal-version: >= 1.2
+name: 3sync
+version: 1.0
+build-type: Simple
+
+-- TODO: provide both 3diff and 3sync
+
+library
+  build-depends: base >= 4.0, filepath, directory, bytestring, unix,
+                 -- from hackage:
+                 hS3, pureMD5
+  exposed-modules:
+    Network.AWS.S3Sync
+
+executable 3sync
+  build-depends: base
+  main-is: 3sync.hs
+
+executable 3diff
+  build-depends: base
+  main-is: 3diff.hs
