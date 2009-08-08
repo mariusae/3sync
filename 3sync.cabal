@@ -7,6 +7,7 @@ build-type: Simple
 
 library
   build-depends: base >= 4.0, filepath, directory, bytestring, unix,
+                 containers,
                  -- from hackage:
                  hS3, pureMD5
   exposed-modules:
@@ -15,7 +16,3 @@ library
 executable 3sync
   build-depends: base
   main-is: 3sync.hs
-
-executable 3diff
-  build-depends: base
-  main-is: 3diff.hs
