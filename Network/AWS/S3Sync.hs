@@ -1,5 +1,5 @@
-module Network.AWS.S3Sync (
-    diff, execute
+module Network.AWS.S3Sync 
+  ( diff, execute
   , Comparator(..)
   , Op(..)
   ) where
@@ -88,11 +88,14 @@ diff comp dir bucket = do
 execute _ [] = return ()
 execute report (op@(Push bucket local remote):ops) = do
   Just conn <- amazonS3ConnectionFromEnv
-  -- TODO: really this should be a logger, maybe run inside a monad
   size <- getFileStatus local >>= return . fileSize
   report op
   contents <- L.readFile local
-  sendObject conn $ S3Object bucket remote "" [("Content-Length", show size)] contents
+  sendObject conn $ S3Object bucket 
+                             remote 
+                             ""
+                             [("Content-Length", show size)] 
+                             contents
   execute report ops
 
 execute report (op@(Pull bucket local remote):ops) = do
