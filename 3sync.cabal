@@ -7,7 +7,8 @@ build-type: Simple
 
 library
   build-depends: base >= 4.0, filepath, directory, bytestring, unix,
-                 containers,
+                 containers, binary, utf8-string, dataenc, Crypto, 
+                 old-locale, time, network-connection, 
                  -- from hackage:
                  hS3, pureMD5, network-minihttp
   exposed-modules:
