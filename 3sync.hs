@@ -1,9 +1,9 @@
 -- | 3sync provides bucket synchronization for S3.
 module Main where
 
-import System.Environment
-import System.Console.GetOpt
-import Text.Printf
+import           System.Environment
+import           System.Console.GetOpt
+import           Text.Printf
 
 import qualified Network.AWS.S3Sync as S3
 
@@ -13,12 +13,14 @@ data Command = Push | Pull
 data Flag = Diff
           | Help
           | Size
+          | Verbose
             deriving (Show, Eq)
 
 options =
- [ Option ['h'] [] (NoArg Help) "show help"
- , Option ['d'] [] (NoArg Diff) "show just the diff"
- , Option ['s'] [] (NoArg Size) "use file size instead of MD5 for comparison"
+ [ Option ['h'] [] (NoArg Help)    "show help"
+ , Option ['d'] [] (NoArg Diff)    "show just the diff"
+ , Option ['s'] [] (NoArg Size)    "use file size instead of MD5 for comparison"
+ , Option ['v'] [] (NoArg Verbose) "verbose operations"
  ]
 
 usage = do
@@ -49,6 +51,7 @@ opts argv =
 
     help = fail . flip (++) " [-h for help]"
 
+main :: IO ()
 main = do
   args <- getArgs >>= opts
   case args of 
@@ -70,4 +73,6 @@ execute flags command b d =
       | Diff `elem` flags = putStr . unlines . map show
       | otherwise         = S3.execute report
 
-    report = putStrLn . show
+    report 
+      | Verbose `elem` flags = putStrLn . show
+      | otherwise            = \_ -> return ()
