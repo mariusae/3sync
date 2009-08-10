@@ -4,25 +4,50 @@ module Network.AWS.S3Sync
   , Op(..)
   ) where
 
-import Control.Monad
-import Control.Exception(evaluate)
+import Control.Monad (forM)
+import Control.Exception (evaluate)
 
-import Network.AWS.S3Bucket
-import Network.AWS.AWSConnection
-import Network.AWS.AWSResult
-import Network.AWS.S3Object
+import Network.AWS.S3Bucket (ListRequest(..), listAllObjects, key, etag, size)
+import Network.AWS.AWSConnection (AWSConnection(..), amazonS3ConnectionFromEnv)
+import Network.AWS.S3Object (S3Object(..), getObject, sendObject, obj_data)
+import qualified Network.Connection as Connection
+import qualified Network.MiniHTTP.Client as Client
+import qualified Network.MiniHTTP.URL as URL
+import Network.MiniHTTP.HTTPConnection (hSource)
+import Network.MiniHTTP.Marshal ( Headers(..)
+                                , Request(..)
+                                , Method(..)
+                                , Reply(..)
+                                , emptyHeaders 
+                                , putRequest ) -- XXX
 
-import Text.Printf
-import Data.List
-import Data.Digest.Pure.MD5
+import Text.Printf (printf)
+import Data.Digest.Pure.MD5 (md5)
+import Data.String (fromString)
+import Data.Maybe (fromJust)
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format (formatTime)
 import qualified Data.Set as S
 import qualified Data.ByteString.Lazy as L
 
-import System.Posix.Files
+import qualified Data.ByteString as B -- XXX
+
+import System.Posix.Files ( fileSize
+                          , getSymbolicLinkStatus
+                          , isSymbolicLink
+                          , isDirectory
+                          , getFileStatus
+                          )
 import System.Directory ( doesDirectoryExist
                         , getDirectoryContents
                         , createDirectoryIfMissing)
 import System.FilePath ((</>), takeDirectory)
+import System.IO (IOMode(..), openFile, hClose)
+import System.Locale (TimeLocale(..))
+
+import Network.AWS.S3 (SignData(..), signRequest)
+
+import qualified Data.Binary.Put as P
 
 -- Strange that something like this isn't in the prelude?
 concatMapM f xs = mapM f xs >>= return . concat
@@ -75,8 +100,9 @@ walkBucket comp bucket = do
     compKey Size = show . size
 
 -- | Walk the bucket & the directory, then compute the differences in
--- | each direction using @Data.Set@, producing a set of operations
+-- | each direction using "Data.Set", producing a set of operations
 -- | that need to be performed in order to synchronize the two.
+diff :: Comparator -> FilePath -> String -> IO [Op]
 diff comp dir bucket = do
   dents3 <- walkBucket comp bucket >>= return . S.fromList
   dents  <- walkDir comp dir       >>= return . S.fromList
@@ -84,18 +110,23 @@ diff comp dir bucket = do
   where
     make which = map ((\p -> which bucket (dir </> p) p) . fst) . S.toList
 
-
+-- TODO: compute MD5 sums? This would be pertinent in terms of
+-- security, since in our case, the MD5 of the uploaded object isn't
+-- part of the signed string.
+execute :: (Op -> IO a) -> [Op] -> IO ()
 execute _ [] = return ()
 execute report (op@(Push bucket local remote):ops) = do
-  Just conn <- amazonS3ConnectionFromEnv
-  size <- getFileStatus local >>= return . fileSize
-  report op
-  contents <- L.readFile local
-  sendObject conn $ S3Object bucket 
-                             remote 
-                             ""
-                             [("Content-Length", show size)] 
-                             contents
+  putFile bucket local remote
+
+--   Just conn <- amazonS3ConnectionFromEnv
+--   size <- getFileStatus local >>= return . fileSize
+--   report op
+--   contents <- L.readFile local
+--   sendObject conn $ S3Object bucket 
+--                              remote 
+--                              ""
+--                              [("Content-Length", show size)] 
+--                              contents
   execute report ops
 
 execute report (op@(Pull bucket local remote):ops) = do
@@ -105,3 +136,99 @@ execute report (op@(Pull bucket local remote):ops) = do
   Right obj <- getObject conn $ S3Object bucket remote "" [] L.empty
   L.writeFile local (obj_data obj)
   execute report ops
+
+-- | A more memory efficient file uploader. This uses
+-- | "Network.MiniHTTP" so that we can stream the file via a data
+-- | source, avoiding using as much memory as the file is big.
+putFile bucket local remote = do
+  Just awsConn <- amazonS3ConnectionFromEnv
+
+  -- Construct a URL and the appropriate headers to use.
+  let Just url = URL.parse 
+               $ fromString 
+               $ printf "http://%s.s3.amazonaws.com/%s" bucket remote
+
+  currentTime <- getCurrentTime
+
+  -- Sign the request
+  let signed = signRequest 
+               SignData 
+               { accessKey       = awsAccessKey awsConn
+               , secretAccessKey = awsSecretKey awsConn
+               , httpVerb        = "PUT"
+               , contentMD5      = ""
+               , contentType     = ""
+               , date            = formatTime timeLocale 
+                                   "%a, %d %b %Y %H:%M:%S GMT" currentTime
+               , bucket          = bucket
+               , resource        = remote
+               }
+
+  -- Construct the HTTP headers.
+  size <- getFileStatus local >>= return . toInteger . fileSize
+  let headers = emptyHeaders {
+      httpDate          = Just currentTime
+    , httpContentLength = Just $ fromInteger $ size
+    , httpHost          = Just $ fromString $ printf "%s.s3.amazonaws.com" bucket
+    , httpAuthorization = Just $ fromString 
+                               $ printf "AWS %s:%s" (awsAccessKey awsConn) signed
+    }
+
+  -- Finally ready, so make a connection.
+  conn <- Client.connection url >>= Client.transport url
+
+  let request = (Request PUT (URL.toRelative url) 1 1 headers)
+
+  -- The source is the file.
+  h      <- openFile local ReadMode
+  source <- hSource (0, fromInteger (size - 1)) h
+
+  r <- Client.request conn request (Just source)
+  case r of 
+    Just (reply, _) | replyStatus reply == 200 -> do
+      putStrLn $ show reply
+      Connection.close conn
+      hClose h
+    _ -> fail "Request error."
+
+  return ()
+
+  where
+    -- | Copy/paste of "Network.MiniHTTP.Marshal", to make sure we can
+    -- | replicate the @Date@ header.
+    timeLocale = TimeLocale 
+                 { wDays = [ ("Sunday", "Sun")
+                           , ("Monday", "Mon")
+                           , ("Tuesday", "Tue")
+                           , ("Wednesday", "Wed")
+                           , ("Thursday", "Thu")
+                           , ("Friday", "Fri")
+                           , ("Saturday", "Sat")
+                           ]
+                 , months = [ ("January", "Jan")
+                            , ("February", "Feb")
+                            , ("March", "Mar")
+                            , ("April", "Apr")
+                            , ("May", "May")
+                            , ("June", "Jun")
+                            , ("July", "Jul")
+                            , ("August", "Aug")
+                            , ("September", "Sep")
+                            , ("October", "Oct")
+                            , ("November", "Nov")
+                            , ("December", "Dec")
+                            ]
+                 , intervals = [ ("year", "years")
+                               , ("month", "months")
+                               , ("day", "days")
+                               , ("hour", "hours")
+                               , ("min", "mins")
+                               , ("sec", "secs")
+                               , ("usec", "usecs")
+                               ]
+                 , amPm = ("AM", "PM")
+                 , dateTimeFmt = "%a %b %e %H:%M:%S %Z %Y"
+                 , dateFmt = "%m/%d/%y"
+                 , timeFmt = "%H:%M:%S"
+                 , time12Fmt = "%I:%M:%S %p"
+                 }
