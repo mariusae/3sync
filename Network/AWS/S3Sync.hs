@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 
 module Network.AWS.S3Sync 
-  ( diff, execute
+  ( diff, execute, hPut
   , Comparator(..)
   , Op(..)
   ) where
@@ -14,9 +14,11 @@ import           Data.String (fromString)
 import           Data.Time.Clock (getCurrentTime)
 import           Data.Time.Format (formatTime)
 import           Data.Typeable (Typeable(..))
+import           Data.Maybe (maybe)
 import           Text.Printf (printf)
 import qualified Data.Set as S
 import qualified Data.ByteString.Lazy as L
+import qualified Data.ByteString as B
 
 import qualified Network.Connection as Connection
 import           System.Posix.Files ( fileSize
@@ -28,12 +30,12 @@ import           System.Posix.Files ( fileSize
 import           System.Directory ( getDirectoryContents
                                   , createDirectoryIfMissing)
 import           System.FilePath ((</>), takeDirectory)
-import           System.IO (IOMode(..), openFile, hClose)
+import           System.IO (IOMode(..), Handle, withFile, hIsEOF)
 import           System.Locale (TimeLocale(..))
 
 import qualified Network.MiniHTTP.Client as Client
 import qualified Network.MiniHTTP.URL as URL
-import           Network.MiniHTTP.HTTPConnection (hSource)
+import           Network.MiniHTTP.HTTPConnection (Source(..), SourceResult(..))
 import           Network.MiniHTTP.Marshal ( Headers(..)
                                           , Request(..)
                                           , Method(..)
@@ -68,7 +70,7 @@ instance Show Op where
   show (Push b l r) = printf "%s => %s/%s" l b r
   show (Pull b l r) = printf "%s <= %s/%s" l b r
 
-data S3Exception = HttpError
+data S3Exception = HttpError String
                    deriving (Show, Typeable)
 
 instance Exception S3Exception
@@ -130,16 +132,8 @@ diff comp dir bucket = do
 execute :: (Op -> IO a) -> [Op] -> IO ()
 execute _ [] = return ()
 execute report ((Push bucket local remote):ops) = do
-  putFile bucket local remote
---   Just conn <- amazonS3ConnectionFromEnv
---   size <- getFileStatus local >>= return . fileSize
---   report op
---   contents <- L.readFile local
---   sendObject conn $ S3Object bucket 
---                              remote 
---                              ""
---                              [("Content-Length", show size)] 
---                              contents
+  size <- getFileStatus local >>= return . Just . toInteger . fileSize
+  withFile local ReadMode $ \h -> hPut h size bucket remote
   execute report ops
 
 execute report (op@(Pull bucket local remote):ops) = do
@@ -153,11 +147,11 @@ execute report (op@(Pull bucket local remote):ops) = do
 -- | A (much) more memory efficient file uploader. This uses
 -- | "Network.MiniHTTP" so that we can stream the file via a data
 -- | source, avoiding using as much memory as the file is big.
-putFile bucket local remote = do
+hPut :: Handle -> Maybe Integer -> String -> String -> IO ()
+hPut handle size bucket remote = do
   -- Some things that are going to be useful throughout:
   Just awsConn <- amazonS3ConnectionFromEnv
   currentTime  <- getCurrentTime
-  size         <- getFileStatus local >>= return . toInteger . fileSize
 
   -- Construct a URL and the appropriate headers to use.
   let httpHost = printf "%s.s3.amazonaws.com" bucket
@@ -181,7 +175,7 @@ putFile bucket local remote = do
   -- Construct the HTTP headers.
   let headers = emptyHeaders 
         { httpDate          = Just currentTime
-        , httpContentLength = Just $ fromInteger $ size
+        , httpContentLength = maybe Nothing (Just . fromInteger) size 
         , httpHost          = Just $ fromString httpHost
         , httpAuthorization = Just $ fromString 
                                    $ printf "AWS %s:%s" 
@@ -198,18 +192,18 @@ putFile bucket local remote = do
                 1 1                   -- http 1.1
                 headers
 
-  -- The source is the file. Open a handle, and let hSource stream it
-  -- over the HTTP connection.
-  h      <- openFile local ReadMode
-  source <- hSource (0, fromInteger (size - 1)) h
+  -- The source is a handle, let hSourceUntilEOF stream it over the
+  -- connection.
+  source <- hSourceUntilEOF handle
 
   -- Issue the actual request, and make sure we have an acceptable
   -- reply
   Client.request conn request (Just source) >>= \r ->
     case r of
-      Just (reply, _) | replyStatus reply == 200 -> 
-           Connection.close conn >> hClose h
-      _ -> throw HttpError
+      Just (reply, _) | replyStatus reply == 200 -> Connection.close conn
+      Just (reply, _) -> throw $ HttpError $ printf "%d: %s" (replyStatus reply)
+                                                             (replyMessage reply)
+      _               -> throw $ HttpError "unknown"
 
   return ()
 
@@ -252,3 +246,13 @@ putFile bucket local remote = do
                  , timeFmt     = "%H:%M:%S"
                  , time12Fmt   = "%I:%M:%S %p"
                  }
+
+hSourceUntilEOF :: Handle -> IO Source
+hSourceUntilEOF handle = 
+  return $ catch readHandle (const $ return SourceError)
+  where
+    readHandle = do
+      eof <- hIsEOF handle
+      if eof
+        then return SourceEOF
+        else B.hGet handle (128 * 1024) >>= return . SourceData

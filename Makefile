@@ -1,7 +1,10 @@
-all: 3sync
+all: 3sync 3put
 
-3sync: *.hs Network/AWS/*.hs
+3sync: 3sync.hs Network/AWS/*.hs
 	ghc --make -o 3sync 3sync.hs
+
+3put: 3put.hs Network/AWS/*.hs
+	ghc --make -o 3put 3put.hs
 
 # test:
 # 	cd tests; make
