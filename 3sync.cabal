@@ -8,7 +8,7 @@ library
                  containers, binary, utf8-string, dataenc, Crypto, 
                  old-locale, time, network-connection, 
                  -- from hackage:
-                 hS3 >= 0.5.1, pureMD5, network-minihttp
+                 hS3 >= 0.5.1, pureMD5, network-minihttp, progress
   exposed-modules:
     Network.AWS.S3Sync
 

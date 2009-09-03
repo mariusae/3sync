@@ -4,6 +4,7 @@ module Network.AWS.S3Sync
   ( diff, execute, hPut
   , Comparator(..)
   , Op(..)
+  , Report(..)
   ) where
 
 import           Control.Monad (forM)
@@ -73,6 +74,9 @@ instance Show Op where
 data S3Exception = HttpError String
                    deriving (Show, Typeable)
 
+data Report = Transferred Integer
+            | Done
+
 instance Exception S3Exception
 
 -- | Walk a local directory, applying the comparator.
@@ -129,26 +133,24 @@ diff comp dir bucket = do
 -- TODO: compute MD5 sums? This would be pertinent in terms of
 -- security, since in our case, the MD5 of the uploaded object isn't
 -- part of the signed string.
-execute :: (Op -> IO a) -> [Op] -> IO ()
+execute :: (Op -> Integer -> IO (Report -> IO())) -> [Op] -> IO ()
 execute _ [] = return ()
-execute report ((Push bucket local remote):ops) = do
+
+execute report (op@(Push bucket local remote):ops) = do
   size <- getFileStatus local >>= return . Just . toInteger . fileSize
-  withFile local ReadMode $ \h -> hPut h size bucket remote
+  report' <- report op $ maybe 0 id size
+  withFile local ReadMode $ \h -> hPut h size bucket remote report'
   execute report ops
 
 execute report (op@(Pull bucket local remote):ops) = do
   Just conn <- amazonS3ConnectionFromEnv
-  report op
   createDirectoryIfMissing True $ takeDirectory local
-  Right obj <- getObject conn $ S3Object bucket remote "" [] L.empty
-  L.writeFile local (obj_data obj)
+  withFile local WriteMode $ \h -> hGet h bucket remote (report op)
+  -- Right obj <- getObject conn $ S3Object bucket remote "" [] L.empty
+  -- L.writeFile local (obj_data obj)
   execute report ops
 
--- | A (much) more memory efficient file uploader. This uses
--- | "Network.MiniHTTP" so that we can stream the file via a data
--- | source, avoiding using as much memory as the file is big.
-hPut :: Handle -> Maybe Integer -> String -> String -> IO ()
-hPut handle size bucket remote = do
+signedHeadersAndUrl bucket remote verb = do
   -- Some things that are going to be useful throughout:
   Just awsConn <- amazonS3ConnectionFromEnv
   currentTime  <- getCurrentTime
@@ -164,7 +166,7 @@ hPut handle size bucket remote = do
       signed = signRequest SignData
         { sdAccessKey       = awsAccessKey awsConn
         , sdSecretAccessKey = awsSecretKey awsConn
-        , sdHttpVerb        = "PUT"
+        , sdHttpVerb        = verb
         , sdContentMD5      = ""
         , sdContentType     = ""
         , sdDate            = dateValue
@@ -172,41 +174,17 @@ hPut handle size bucket remote = do
         , sdResource        = remote
         }
 
-  -- Construct the HTTP headers.
   let headers = emptyHeaders 
-        { httpDate          = Just currentTime
-        , httpContentLength = maybe Nothing (Just . fromInteger) size 
-        , httpHost          = Just $ fromString httpHost
-        , httpAuthorization = Just $ fromString 
-                                   $ printf "AWS %s:%s" 
-                                            (awsAccessKey awsConn) signed
-        }
+                { httpDate          = Just currentTime
+                , httpHost          = Just $ fromString httpHost
+                , httpAuthorization = 
+                    Just $ fromString 
+                         $ printf "AWS %s:%s" (awsAccessKey awsConn) signed
+                }
 
-  -- We're finally ready, so make a connection, construct the request,
-  -- and issue it.
-  conn <- Client.connection url >>= Client.transport url
-
-  let request = Request 
-                PUT
-                (URL.toRelative url)  -- the remote path
-                1 1                   -- http 1.1
-                headers
-
-  -- The source is a handle, let hSourceUntilEOF stream it over the
-  -- connection.
-  source <- hSourceUntilEOF handle
-
-  -- Issue the actual request, and make sure we have an acceptable
-  -- reply
-  Client.request conn request (Just source) >>= \r ->
-    case r of
-      Just (reply, _) | replyStatus reply == 200 -> Connection.close conn
-      Just (reply, _) -> throw $ HttpError $ printf "%d: %s" (replyStatus reply)
-                                                             (replyMessage reply)
-      _               -> throw $ HttpError "unknown"
-
-  return ()
-
+  -- Finally, construct the HTTP headers.
+  return $ (url, headers)
+                              
   where
     -- | Snagged from "Network.MiniHTTP.Marshal", to make sure we can
     -- | replicate the contents of the @Date@ header.
@@ -247,12 +225,80 @@ hPut handle size bucket remote = do
                  , time12Fmt   = "%I:%M:%S %p"
                  }
 
-hSourceUntilEOF :: Handle -> IO Source
-hSourceUntilEOF handle = 
+-- | A (much) more memory efficient file uploader. This uses
+-- | "Network.MiniHTTP" so that we can stream the file via a data
+-- | source, avoiding using as much memory as the file is big.
+hPut :: Handle -> Maybe Integer -> String -> String -> (Report -> IO()) -> IO ()
+hPut handle size bucket remote report = do
+  (url, headers') <- signedHeadersAndUrl bucket remote "PUT"
+  let headers = headers' { httpContentLength = maybe Nothing (Just . fromInteger) size }
+
+  -- We're finally ready, so make a connection, construct the request,
+  -- and issue it.
+  conn <- Client.connection url >>= Client.transport url
+
+  let request = Request 
+                PUT
+                (URL.toRelative url)  -- the remote path
+                1 1                   -- http 1.1
+                headers
+
+  -- The source is a handle, let hSourceUntilEOF stream it over the
+  -- connection.
+  source <- hSourceUntilEOF handle report
+
+  -- Issue the actual request, and make sure we have an acceptable
+  -- reply
+  Client.request conn request (Just source) >>= \r ->
+    case r of
+      Just (reply, _) | replyStatus reply == 200 -> Connection.close conn
+      Just (reply, _) -> throw $ HttpError 
+                               $ printf "%d: %s" (replyStatus reply)
+                                                 (replyMessage reply)
+      _               -> throw $ HttpError "unknown"
+
+  return ()
+
+hGet handle bucket remote report = do
+  (url, headers) <- signedHeadersAndUrl bucket remote "GET"
+
+  conn <- Client.connection url >>= Client.transport url
+
+  let request = Request
+                GET
+                (URL.toRelative url)
+                1 1
+                headers
+
+  Client.request conn request Nothing >>= \r ->
+    case r of 
+      Just (reply, _) | replyStatus reply /= 200 -> 
+        throw $ HttpError $ printf "%d: %s" (replyStatus reply) (replyMessage reply)
+      Just (reply, Just source) ->
+        let Just clh = httpContentLength $ replyHeaders reply in
+        report (toInteger clh) >>= readSourceToHandle source
+      _ -> throw $ HttpError "No result?"
+
+  where
+    readSourceToHandle source report = do
+      result <- source
+      case result of
+        SourceData bs -> do
+          report $ Transferred (toInteger $ B.length bs)
+          B.hPut handle bs 
+          readSourceToHandle source report
+        SourceEOF -> report Done >> return ()
+        SourceError -> throw $ HttpError "unknown"
+
+hSourceUntilEOF :: Handle -> (Report -> IO()) -> IO Source
+hSourceUntilEOF handle report = 
   return $ catch readHandle (const $ return SourceError)
   where
     readHandle = do
       eof <- hIsEOF handle
       if eof
-        then return SourceEOF
-        else B.hGet handle (128 * 1024) >>= return . SourceData
+        then report Done >> return SourceEOF
+        -- XXX: this is actually wrong -- we want the real count, so
+        -- delay by one? -- report only after done with the block
+        else (report $ Transferred (128 * 1024)) >>
+             B.hGet handle (128 * 1024) >>= return . SourceData

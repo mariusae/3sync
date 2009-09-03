@@ -23,7 +23,7 @@ main = do
       -- we can send the object. This basically precludes streaming
       -- large objects :-(
       Just conn <- amazonS3ConnectionFromEnv
-      contents <- L.hGetContents stdin
+      contents  <- L.hGetContents stdin
       sendObject conn S3Object { obj_bucket   = bucket
                                , obj_name     = path
                                , content_type = ""
