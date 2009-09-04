@@ -7,7 +7,9 @@ import           System.IO (hFlush, stdout)
 import qualified System.Console.Progress as P
 import           Text.Printf
 import           Data.IORef
-import           Data.Time.Clock (getCurrentTime, secondsToDiffTime, UTCTime(..))
+import           Data.Time.Clock ( getCurrentTime
+                                 , secondsToDiffTime
+                                 , UTCTime(..))
 import           Data.Time.Calendar (Day(..))
 
 import qualified Network.AWS.S3Sync as S3
@@ -86,7 +88,8 @@ execute flags command b d = do
             case r of
               S3.Transferred howmany -> do
                 now    <- getCurrentTime
-                status <- atomicModifyIORef p $ P.drawProgressBar now . P.update howmany
+                status <- atomicModifyIORef p $ P.drawProgressBar now 
+                                              . P.update howmany
                 putStr $ "\r" ++ (show op) ++ ": " ++ status
                 hFlush stdout
               S3.Done -> do

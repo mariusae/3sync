@@ -7,7 +7,7 @@ module Network.AWS.S3Sync
   , Report(..)
   ) where
 
-import           Control.Monad (forM)
+import           Control.Monad (forM, when)
 import           Control.Exception (Exception(..), evaluate, throw)
 
 import           Data.Digest.Pure.MD5 (md5)
@@ -16,6 +16,7 @@ import           Data.Time.Clock (getCurrentTime)
 import           Data.Time.Format (formatTime)
 import           Data.Typeable (Typeable(..))
 import           Data.Maybe (maybe)
+import           Data.IORef (newIORef, atomicModifyIORef, IORef)
 import           Text.Printf (printf)
 import qualified Data.Set as S
 import qualified Data.ByteString.Lazy as L
@@ -245,7 +246,8 @@ hPut handle size bucket remote report = do
 
   -- The source is a handle, let hSourceUntilEOF stream it over the
   -- connection.
-  source <- hSourceUntilEOF handle report
+  first  <- newIORef $ False
+  source <- hSourceUntilEOF handle report first
 
   -- Issue the actual request, and make sure we have an acceptable
   -- reply
@@ -273,7 +275,8 @@ hGet handle bucket remote report = do
   Client.request conn request Nothing >>= \r ->
     case r of 
       Just (reply, _) | replyStatus reply /= 200 -> 
-        throw $ HttpError $ printf "%d: %s" (replyStatus reply) (replyMessage reply)
+        throw $ HttpError $ printf "%d: %s" (replyStatus reply) 
+                                            (replyMessage reply)
       Just (reply, Just source) ->
         let Just clh = httpContentLength $ replyHeaders reply in
         report (toInteger clh) >>= readSourceToHandle source
@@ -290,15 +293,15 @@ hGet handle bucket remote report = do
         SourceEOF -> report Done >> return ()
         SourceError -> throw $ HttpError "unknown"
 
-hSourceUntilEOF :: Handle -> (Report -> IO()) -> IO Source
-hSourceUntilEOF handle report = 
+hSourceUntilEOF :: Handle -> (Report -> IO()) -> IORef Bool-> IO Source
+hSourceUntilEOF handle report first = 
   return $ catch readHandle (const $ return SourceError)
   where
     readHandle = do
       eof <- hIsEOF handle
       if eof
         then report Done >> return SourceEOF
-        -- XXX: this is actually wrong -- we want the real count, so
-        -- delay by one? -- report only after done with the block
-        else (report $ Transferred (128 * 1024)) >>
-             B.hGet handle (128 * 1024) >>= return . SourceData
+        else do
+          isFirst <- atomicModifyIORef first $ (,) False
+          when (not isFirst) $ report (Transferred (128 * 1024))
+          B.hGet handle (128 * 1024) >>= return . SourceData

@@ -5,7 +5,6 @@ import           System.Environment (getProgName, getArgs)
 import           System.IO (stdin)
 import qualified Data.ByteString.Lazy as L
 
-
 import           Network.AWS.AWSConnection (amazonS3ConnectionFromEnv)
 import           Network.AWS.S3Object (S3Object(..), sendObject)
 
